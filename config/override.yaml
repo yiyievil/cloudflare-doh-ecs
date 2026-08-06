@@ -1,16 +1,16 @@
 # ============================================================
-#  Sparkle / FlClash  覆写文件（DNS 分流 + fut.gg 走代理）
+#  Sparkle / FlClash  整体分流 + DNS 净化 覆写文件
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
 #  前提：已在 Sparkle「设置 → 高级设置」关闭"接管 DNS 设置"
 #
-#  特性：
-#  - 内置「🎯 分流主组」选择组，自动包含订阅所有节点
-#  - fut.gg 走「🎯 分流主组」：你在代理页切换该组的节点，
-#    覆写规则始终生效，无需每次改配置
+#  特点：
+#  - DNS 净化：国内走国内 DoH，海外走自建 DoH
+#  - 整体分流：国内直连，海外跟随订阅主代理组"星尘云"
+#  - 广告 / 恶意域名拦截
 # ============================================================
 
-# ---------- 1. DNS 分流 ----------
+# ---------- 1. DNS 净化 ----------
 # 国内域名走国内 DoH（干净快），海外域名走自建 DoH（不污染）
 dns:
   enable: true
@@ -32,19 +32,21 @@ dns:
     - https://dns.google/dns-query
   respect-rules: true
 
-# ---------- 2. 分流主组（自动包含订阅所有节点） ----------
-+proxy-groups:
-  - name: 🎯 分流主组
-    type: select
-    include-all: true
-    include-all-proxies: true
-
-# ---------- 3. fut.gg 走「🎯 分流主组」 ----------
-# 切换「🎯 分流主组」的节点即可，无需改覆写
+# ---------- 2. 整体分流规则 ----------
+# 出口"星尘云"= 订阅主代理组。你切换该组的节点，海外流量跟随。
+# 若换订阅，请把"星尘云"改成新订阅的主代理组名。
 +rules:
-  - DOMAIN-SUFFIX,fut.gg,🎯 分流主组
-  - DOMAIN-SUFFIX,stormstrike.gg,🎯 分流主组
-  - DOMAIN-SUFFIX,easports.com,🎯 分流主组
-  - DOMAIN-SUFFIX,ea.com,🎯 分流主组
-  - DOMAIN-SUFFIX,origin.com,🎯 分流主组
-  - DOMAIN-SUFFIX,eaapp.com,🎯 分流主组
+  # 2.1 广告 / 恶意 / 追踪 域名拦截
+  - GEOSITE,category-ads-all,REJECT
+  - GEOSITE,private,REJECT
+
+  # 2.2 国内域名/IP 直连（不绕路，速度快）
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT
+
+  # 2.3 局域网直连
+  - GEOIP,LAN,DIRECT
+  - GEOIP,private,DIRECT
+
+  # 2.4 兜底：其余海外域名走订阅主代理组"星尘云"
+  - MATCH,星尘云
