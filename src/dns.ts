@@ -289,7 +289,7 @@ function encodeQuestion(question: DnsQuestion): Uint8Array {
 
 export function buildDnsError(
   request: Uint8Array,
-  rcode: 1 | 2,
+  rcode: 1 | 2 | 3,
   question?: DnsQuestion
 ): Uint8Array {
   const header = new Uint8Array(DNS_HEADER_LENGTH);
