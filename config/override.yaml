@@ -7,23 +7,23 @@
 # ============================================================
 
 # ---------- 1. DNS 分流 ----------
-# 国内域名走国内 DoH（干净快），海外域名走国外 DoH（不污染）
-# 先用公共 DoH 确认稳定，后续可替换为自建 DoH
+# 国内域名走国内 DoH（干净快），海外域名走自建 DoH（不污染）
 dns:
   enable: true
   nameserver:
     - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
   fallback:
+    - https://ccjccj.online/doh
     - https://dns.google/dns-query
-    - https://cloudflare-dns.com/dns-query
   nameserver-policy:
     "geosite:cn":
       - https://doh.pub/dns-query
       - https://dns.alidns.com/dns-query
     "geosite:geolocation-!cn":
+      - https://ccjccj.online/doh
       - https://dns.google/dns-query
-      - https://cloudflare-dns.com/dns-query
+  # 代理节点域名解析：用 Google DNS，不用自建 DoH
   proxy-server-nameserver:
     - https://dns.google/dns-query
   respect-rules: true
