@@ -3,6 +3,7 @@ import { buildDnsError, DnsFormatError, parseDnsMessage, validateUpstreamRespons
 import { rewriteEcs } from "./ecs";
 import { clientIpFromSingleHeader, clientIpFromXff, subnetForEcs } from "./ip";
 import { ensureRules, isDomesticDomain, updateRules } from "./rules";
+import { isAdDomain } from "./adblock";
 import { readConfig, type WorkerConfig } from "./config";
 import type { Env } from "./types";
 
@@ -259,6 +260,12 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
     parsed = parseDnsMessage(originalQuery);
   } catch {
     return dnsResponse(buildDnsError(originalQuery, 1));
+  }
+
+  // 广告域名拦截：命中黑名单直接返回 NXDOMAIN，不向上游查询
+  const qname = parsed.question.name.ruleName;
+  if (qname !== null && isAdDomain(qname)) {
+    return dnsResponse(buildDnsError(originalQuery, 3, parsed.question));
   }
 
   // 先查内存缓存（会替换事务 ID 为当前请求的 ID）
