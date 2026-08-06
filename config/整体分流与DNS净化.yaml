@@ -20,13 +20,15 @@ dns:
     "geosite:geolocation-!cn":
       - https://ccjccj.online/doh
       - https://dns.google/dns-query
+  # 代理节点域名解析：必须用稳定可用的国外 DNS，不要用自建 DoH
+  # 否则代理节点连不上会导致所有网站打不开
   proxy-server-nameserver:
-    - https://ccjccj.online/doh
+    - https://dns.google/dns-query
   respect-rules: true
 
 # ---------- 2. 整体分流规则 ----------
 # 这些规则会插到订阅自带规则之前，优先级更高。
-# 海外 DNS 已全部使用自建 DoH：https://ccjccj.online/doh
+# 海外 DNS 已使用自建 DoH：https://ccjccj.online/doh
 #
 # 注意：请把下面的 PROXY 改成你订阅里的主代理组名
 # （多数订阅叫 PROXY 或 🚀 节点选择，若不对请到"代理"页面查看）
