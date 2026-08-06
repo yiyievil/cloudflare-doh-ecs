@@ -5,14 +5,15 @@
 #  本版不含 dns 块：DNS 完全使用订阅自带的设置。
 #  已关闭 Sparkle 的"接管 DNS 设置"，订阅自带 DNS 可正常工作。
 #  只保留 fut.gg 走代理规则。
+#
+#  代理组名：星尘云（请确认代理页面显示的组名与此一致）
 # ============================================================
 
 # ---------- 仅 fut.gg 走代理 ----------
-# 主代理组名：PROXY（请确认订阅里确实是这个名字）
 +rules:
-  - DOMAIN-SUFFIX,fut.gg,PROXY
-  - DOMAIN-SUFFIX,stormstrike.gg,PROXY
-  - DOMAIN-SUFFIX,easports.com,PROXY
-  - DOMAIN-SUFFIX,ea.com,PROXY
-  - DOMAIN-SUFFIX,origin.com,PROXY
-  - DOMAIN-SUFFIX,eaapp.com,PROXY
+  - DOMAIN-SUFFIX,fut.gg,星尘云
+  - DOMAIN-SUFFIX,stormstrike.gg,星尘云
+  - DOMAIN-SUFFIX,easports.com,星尘云
+  - DOMAIN-SUFFIX,ea.com,星尘云
+  - DOMAIN-SUFFIX,origin.com,星尘云
+  - DOMAIN-SUFFIX,eaapp.com,星尘云
