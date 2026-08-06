@@ -1,42 +1,14 @@
 # ============================================================
-#  Sparkle / FlClash  覆写文件（DNS 用自建 DoH + fut.gg 走代理）
+#  Sparkle / FlClash  覆写文件（最简测试版）
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
-#  思路：
-#  1. DNS 分流用你的自建 DoH（ccjccj.online）做海外解析
-#  2. 仅保留 fut.gg 走代理规则（DNS 分流无法替代这条）
-#  3. proxy-server-nameserver 保持 Google DNS（关键：
-#     若用自建 DoH 解析代理节点域名，客户端本地连不上
-#     会导致代理节点全部解析失败、所有网站打不开）
+#  本版只做一件事：让 fut.gg 走代理。
+#  - 完全不含 dns 配置块（避免覆盖订阅自带 DNS / fake-ip）
+#  - 不含 MATCH / GEOSITE / GEOIP（避免干扰直连）
+#  如果连这版都打不开，问题就在覆写机制或代理组名本身。
 # ============================================================
 
-# ---------- 1. DNS 净化（自建 DoH 做海外分流） ----------
-dns:
-  enable: true
-  nameserver:
-    - https://doh.pub/dns-query
-    - https://dns.alidns.com/dns-query
-  fallback:
-    - https://ccjccj.online/doh
-    - https://dns.google/dns-query
-  nameserver-policy:
-    "geosite:cn":
-      - https://doh.pub/dns-query
-      - https://dns.alidns.com/dns-query
-    "geosite:geolocation-!cn":
-      - https://ccjccj.online/doh
-      - https://dns.google/dns-query
-  # 代理节点域名解析：必须用稳定可用的国外 DNS
-  proxy-server-nameserver:
-    - https://dns.google/dns-query
-  respect-rules: true
-
-# ---------- 2. fut.gg 走代理（DNS 分流无法替代） ----------
+# ---------- 仅 fut.gg 走代理 ----------
 # 主代理组名：PROXY（请确认订阅里确实是这个名字）
 +rules:
   - DOMAIN-SUFFIX,fut.gg,PROXY
-  - DOMAIN-SUFFIX,stormstrike.gg,PROXY
-  - DOMAIN-SUFFIX,easports.com,PROXY
-  - DOMAIN-SUFFIX,ea.com,PROXY
-  - DOMAIN-SUFFIX,origin.com,PROXY
-  - DOMAIN-SUFFIX,eaapp.com,PROXY
