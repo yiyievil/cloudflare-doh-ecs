@@ -3,7 +3,11 @@
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
 #  前提：已在 Sparkle「设置 → 高级设置」关闭"接管 DNS 设置"
-#  代理组名：星尘云
+#
+#  特性：
+#  - 内置「🎯 分流主组」选择组，自动包含订阅所有节点
+#  - fut.gg 走「🎯 分流主组」：你在代理页切换该组的节点，
+#    覆写规则始终生效，无需每次改配置
 # ============================================================
 
 # ---------- 1. DNS 分流 ----------
@@ -28,11 +32,19 @@ dns:
     - https://dns.google/dns-query
   respect-rules: true
 
-# ---------- 2. fut.gg 走代理 ----------
+# ---------- 2. 分流主组（自动包含订阅所有节点） ----------
++proxy-groups:
+  - name: 🎯 分流主组
+    type: select
+    include-all: true
+    include-all-proxies: true
+
+# ---------- 3. fut.gg 走「🎯 分流主组」 ----------
+# 切换「🎯 分流主组」的节点即可，无需改覆写
 +rules:
-  - DOMAIN-SUFFIX,fut.gg,星尘云
-  - DOMAIN-SUFFIX,stormstrike.gg,星尘云
-  - DOMAIN-SUFFIX,easports.com,星尘云
-  - DOMAIN-SUFFIX,ea.com,星尘云
-  - DOMAIN-SUFFIX,origin.com,星尘云
-  - DOMAIN-SUFFIX,eaapp.com,星尘云
+  - DOMAIN-SUFFIX,fut.gg,🎯 分流主组
+  - DOMAIN-SUFFIX,stormstrike.gg,🎯 分流主组
+  - DOMAIN-SUFFIX,easports.com,🎯 分流主组
+  - DOMAIN-SUFFIX,ea.com,🎯 分流主组
+  - DOMAIN-SUFFIX,origin.com,🎯 分流主组
+  - DOMAIN-SUFFIX,eaapp.com,🎯 分流主组
