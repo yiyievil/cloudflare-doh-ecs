@@ -9,8 +9,8 @@
 # ---------- 1. DNS 分流（自建 DoH 做海外解析） ----------
 dns:
   enable: true
-  # redir-host 模式：域名解析成真实 IP，最稳妥，避免 fake-ip 与规则冲突
-  enhanced-mode: redir-host
+  # 不强制设置 enhanced-mode，保持订阅自带的 DNS 模式（多为 fake-ip），
+  # 避免与订阅配置冲突。仅覆盖 DNS 服务器地址实现分流。
   nameserver:
     - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
