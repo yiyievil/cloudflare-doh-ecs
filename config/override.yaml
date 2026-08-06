@@ -1,35 +1,13 @@
 # ============================================================
-#  Sparkle / FlClash  覆写文件（DNS 分流 + fut.gg 走代理）
+#  Sparkle / FlClash  覆写文件（仅 fut.gg 走代理）
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
-#  重要：请先在 Sparkle 「设置 → 高级设置」里【关闭】"接管 DNS 设置"
-#  否则本文件的 dns 配置会被 Sparkle 的 fake-ip 接管覆盖，导致打不开。
+#  本版不含 dns 块：DNS 完全使用订阅自带的设置。
+#  已关闭 Sparkle 的"接管 DNS 设置"，订阅自带 DNS 可正常工作。
+#  只保留 fut.gg 走代理规则。
 # ============================================================
 
-# ---------- 1. DNS 分流（自建 DoH 做海外解析） ----------
-dns:
-  enable: true
-  # 不强制设置 enhanced-mode，保持订阅自带的 DNS 模式（多为 fake-ip），
-  # 避免与订阅配置冲突。仅覆盖 DNS 服务器地址实现分流。
-  nameserver:
-    - https://doh.pub/dns-query
-    - https://dns.alidns.com/dns-query
-  fallback:
-    - https://ccjccj.online/doh
-    - https://dns.google/dns-query
-  nameserver-policy:
-    "geosite:cn":
-      - https://doh.pub/dns-query
-      - https://dns.alidns.com/dns-query
-    "geosite:geolocation-!cn":
-      - https://ccjccj.online/doh
-      - https://dns.google/dns-query
-  # 代理节点域名解析：必须用稳定可用的国外 DNS
-  proxy-server-nameserver:
-    - https://dns.google/dns-query
-  respect-rules: true
-
-# ---------- 2. fut.gg 走代理（DNS 分流无法替代） ----------
+# ---------- 仅 fut.gg 走代理 ----------
 # 主代理组名：PROXY（请确认订阅里确实是这个名字）
 +rules:
   - DOMAIN-SUFFIX,fut.gg,PROXY
