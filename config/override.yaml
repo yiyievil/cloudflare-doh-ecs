@@ -1,15 +1,34 @@
 # ============================================================
-#  Sparkle / FlClash  覆写文件（仅 fut.gg 走代理）
+#  Sparkle / FlClash  覆写文件（DNS 分流 + fut.gg 走代理）
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
-#  本版不含 dns 块：DNS 完全使用订阅自带的设置。
-#  已关闭 Sparkle 的"接管 DNS 设置"，订阅自带 DNS 可正常工作。
-#  只保留 fut.gg 走代理规则。
-#
-#  代理组名：星尘云（请确认代理页面显示的组名与此一致）
+#  前提：已在 Sparkle「设置 → 高级设置」关闭"接管 DNS 设置"
+#  代理组名：星尘云
 # ============================================================
 
-# ---------- 仅 fut.gg 走代理 ----------
+# ---------- 1. DNS 分流 ----------
+# 国内域名走国内 DoH（干净快），海外域名走国外 DoH（不污染）
+# 先用公共 DoH 确认稳定，后续可替换为自建 DoH
+dns:
+  enable: true
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback:
+    - https://dns.google/dns-query
+    - https://cloudflare-dns.com/dns-query
+  nameserver-policy:
+    "geosite:cn":
+      - https://doh.pub/dns-query
+      - https://dns.alidns.com/dns-query
+    "geosite:geolocation-!cn":
+      - https://dns.google/dns-query
+      - https://cloudflare-dns.com/dns-query
+  proxy-server-nameserver:
+    - https://dns.google/dns-query
+  respect-rules: true
+
+# ---------- 2. fut.gg 走代理 ----------
 +rules:
   - DOMAIN-SUFFIX,fut.gg,星尘云
   - DOMAIN-SUFFIX,stormstrike.gg,星尘云
