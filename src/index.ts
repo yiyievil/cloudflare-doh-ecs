@@ -8,10 +8,80 @@ import type { Env } from "./types";
 
 const MAX_REQUEST_BYTES = 4096;
 const MAX_RESPONSE_BYTES = 65535;
-const UPSTREAM_TIMEOUT_MS = 3000;
+const UPSTREAM_TIMEOUT_MS = 2000;
 const ECS_IPV4_PREFIX = 24;
 const ECS_IPV6_PREFIX = 56;
 const DNS_CONTENT_TYPE = "application/dns-message";
+
+// 内存级 DNS 响应缓存，减少重复上游查询
+const DNS_CACHE_MAX_SIZE = 512;
+const DNS_CACHE_TTL_MS = 60_000;
+interface DnsCacheEntry {
+  body: Uint8Array;
+  expiresAt: number;
+}
+const dnsCache = new Map<string, DnsCacheEntry>();
+
+// 需强制走国内 DNS 的域名（国内可访问性更好），避免被分流到国外上游
+const FORCE_DOMESTIC_SUFFIXES = [
+  "github.com",
+  "github.io",
+  "githubapp.com",
+  "githubassets.com",
+  "githubusercontent.com",
+  "githubcopilot.com",
+  "github.blog",
+  "github.dev",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+  "codeload.github.com",
+  "api.github.com",
+  "avatars.githubusercontent.com"
+];
+
+function isForcedDomestic(ruleName: string): boolean {
+  const lower = ruleName.toLowerCase();
+  return FORCE_DOMESTIC_SUFFIXES.some((suffix) =>
+    lower === suffix || lower.endsWith("." + suffix)
+  );
+}
+
+function dnsCacheKey(query: Uint8Array): string {
+  // 跳过前 2 字节事务 ID，用 flags + question 部分作为缓存键
+  const start = 2;
+  const len = Math.min(query.length - start, 30);
+  let key = "";
+  for (let i = 0; i < len; i += 1) key += (query[start + i] ?? 0).toString(16).padStart(2, "0");
+  return key;
+}
+
+// 从缓存生成响应：必须把响应报文的 2 字节事务 ID 替换为当前请求的事务 ID，
+// 否则客户端会因 ID 不匹配而丢弃响应。
+function dnsCacheGet(query: Uint8Array): Uint8Array | null {
+  const key = dnsCacheKey(query);
+  const entry = dnsCache.get(key);
+  if (entry === undefined) return null;
+  if (Date.now() > entry.expiresAt) {
+    dnsCache.delete(key);
+    return null;
+  }
+  const body = entry.body.slice();
+  if (body.length >= 2 && query.length >= 2) {
+    body[0] = query[0] ?? 0;
+    body[1] = query[1] ?? 0;
+  }
+  return body;
+}
+
+function dnsCacheSet(query: Uint8Array, body: Uint8Array): void {
+  const key = dnsCacheKey(query);
+  if (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
+    // 简单淘汰：删除最早插入的条目
+    const firstKey = dnsCache.keys().next().value;
+    if (firstKey !== undefined) dnsCache.delete(firstKey);
+  }
+  dnsCache.set(key, { body: body.slice(), expiresAt: Date.now() + DNS_CACHE_TTL_MS });
+}
 
 class UpstreamFailure extends Error {
   constructor(
@@ -63,15 +133,13 @@ function emptyResponse(status: number, extraHeaders?: HeadersInit): Response {
   return new Response(null, { status, headers });
 }
 
-function dnsResponse(body: Uint8Array, status = 200): Response {
-  return new Response(toArrayBuffer(body), {
-    status,
-    headers: {
-      "Content-Type": DNS_CONTENT_TYPE,
-      "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff"
-    }
-  });
+function dnsResponse(body: Uint8Array, status = 200, cacheMaxAge = 0): Response {
+  const headers: Record<string, string> = {
+    "Content-Type": DNS_CONTENT_TYPE,
+    "X-Content-Type-Options": "nosniff"
+  };
+  headers["Cache-Control"] = cacheMaxAge > 0 ? `public, max-age=${cacheMaxAge}` : "no-store";
+  return new Response(toArrayBuffer(body), { status, headers });
 }
 
 function contentTypeIsDns(request: Request): boolean {
@@ -193,6 +261,12 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
     return dnsResponse(buildDnsError(originalQuery, 1));
   }
 
+  // 先查内存缓存（会替换事务 ID 为当前请求的 ID）
+  const cached = dnsCacheGet(originalQuery);
+  if (cached !== null) {
+    return dnsResponse(cached, 200, 30);
+  }
+
   let forwardedQuery: Uint8Array;
   try {
     const ip =
@@ -210,8 +284,13 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
   let domestic = false;
   const ruleName = parsed.question.name.ruleName;
   if (ruleName !== null) {
-    const rules = await ensureRules(env);
-    domestic = rules !== null && isDomesticDomain(rules, ruleName);
+    // GitHub 相关域名强制走国内 DNS，获取国内可访问的 IP
+    if (isForcedDomestic(ruleName)) {
+      domestic = true;
+    } else {
+      const rules = await ensureRules(env);
+      domestic = rules !== null && isDomesticDomain(rules, ruleName);
+    }
   }
   const upstreams = domestic ? config.domesticUrls : config.globalUrls;
   const group = domestic ? "domestic" : "global";
@@ -226,7 +305,9 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
         logUpstreamFailure(group, role, { reason: "dns_servfail" });
         continue;
       }
-      return dnsResponse(upstreamBody);
+      // 缓存成功响应
+      dnsCacheSet(originalQuery, upstreamBody);
+      return dnsResponse(upstreamBody, 200, 30);
     } catch (error) {
       logUpstreamFailure(group, role, upstreamFailureDiagnostic(error));
       // 仅在当前国内或国外组内尝试下一上游，不进行跨组回退。
@@ -236,13 +317,21 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const expectedPath = env.DOH_PATH ?? "/doh";
+
+  // 纯 DoH 域名，非 DoH 路径返回提示
+  if (url.pathname !== expectedPath) {
+    return new Response("DNS-over-HTTPS endpoint. Use /doh with GET ?dns= or POST application/dns-message.", {
+      status: 200,
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
+    });
+  }
+
   let config: WorkerConfig;
   try {
     config = readConfig(env);
   } catch {
-    const url = new URL(request.url);
-    const expectedPath = env.DOH_PATH ?? "/doh";
-    if (url.pathname !== expectedPath) return emptyResponse(404);
     let query = new Uint8Array();
     if (request.method === "POST") {
       try {
