@@ -1,60 +1,38 @@
 # ============================================================
-#  Sparkle / FlClash  整体分流 + DNS 净化 覆写文件
+#  Sparkle / FlClash  纯分流  覆写文件
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
-#  前提：已在 Sparkle「设置 → 高级设置」关闭"接管 DNS 设置"
-#
 #  特点：
-#  - DNS 净化：国内走国内 DoH，海外走自建 DoH
-#  - 整体分流：国内直连，海外走「🎯 分流主组」
+#  - 仅做分流，不含 DNS 配置（DNS 走订阅自带，或用 doh-only.yaml）
+#  - 国内直连，海外走「🎯 分流主组」
 #  - 「🎯 分流主组」自动包含当前订阅所有节点，切换任意订阅仍生效
 #  - 广告 / 恶意域名拦截
+#
+#  注意：若需 DNS 净化，请同时导入 doh-only.yaml（两个可并存）
 # ============================================================
 
-# ---------- 1. DNS 净化 ----------
-# 国内域名走国内 DoH（干净快），海外域名走自建 DoH（不污染）
-dns:
-  enable: true
-  nameserver:
-    - https://doh.pub/dns-query
-    - https://dns.alidns.com/dns-query
-  fallback:
-    - https://ccjccj.online/doh
-    - https://dns.google/dns-query
-  nameserver-policy:
-    "geosite:cn":
-      - https://doh.pub/dns-query
-      - https://dns.alidns.com/dns-query
-    "geosite:geolocation-!cn":
-      - https://ccjccj.online/doh
-      - https://dns.google/dns-query
-  # 代理节点域名解析：用 Google DNS，不用自建 DoH
-  proxy-server-nameserver:
-    - https://dns.google/dns-query
-  respect-rules: true
-
-# ---------- 2. 分流主组（自动包含任意订阅的所有节点） ----------
+# ---------- 1. 分流主组（自动包含任意订阅的所有节点） ----------
 +proxy-groups:
   - name: 🎯 分流主组
     type: select
     include-all: true
     include-all-proxies: true
 
-# ---------- 3. 整体分流规则 ----------
+# ---------- 2. 整体分流规则 ----------
 # 海外流量走「🎯 分流主组」。切换该组的节点，海外流量跟随。
 # 无论切换哪个订阅，「🎯 分流主组」都会自动包含该订阅所有节点。
 +rules:
-  # 3.1 广告 / 恶意 / 追踪 域名拦截
+  # 2.1 广告 / 恶意 / 追踪 域名拦截
   - GEOSITE,category-ads-all,REJECT
   - GEOSITE,private,REJECT
 
-  # 3.2 国内域名/IP 直连（不绕路，速度快）
+  # 2.2 国内域名/IP 直连（不绕路，速度快）
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT
 
-  # 3.3 局域网直连
+  # 2.3 局域网直连
   - GEOIP,LAN,DIRECT
   - GEOIP,private,DIRECT
 
-  # 3.4 兜底：其余海外域名走「🎯 分流主组」
+  # 2.4 兜底：其余海外域名走「🎯 分流主组」
   - MATCH,🎯 分流主组
