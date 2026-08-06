@@ -1,18 +1,18 @@
 # ============================================================
-#  Sparkle / FlClash 整体分流  覆写文件（Mihomo 内核）
+#  Sparkle / FlClash 整体分流  覆写文件（安全版）
 #  用法：客户端 → 覆写 → 导入此文件，然后开启即可
 #
-#  注意：本版【不包含】DNS 配置块，DNS 使用订阅自带的设置。
-#  原因：自建 DoH（ccjccj.online）在客户端本地可能连不上，
-#  若用它作为 DNS 会导致所有网站解析失败、全部打不开。
-#  如需 DNS 净化，请参考文件底部注释单独添加。
+#  本版特点：
+#  1. 不包含 DNS 配置块（用订阅自带 DNS）
+#  2. 不使用 GEOSITE / GEOIP（避免依赖 geosite/geoip 数据库，
+#     数据库缺失会导致内核加载失败、所有网站打不开）
+#  3. 仅用 DOMAIN-SUFFIX（纯文本规则）+ MATCH 兜底
 # ============================================================
 
-# ---------- 整体分流规则 ----------
-# 这些规则会插到订阅自带规则之前，优先级更高。
-# 主代理组名：PROXY（请确认你订阅里确实是这个名字）
+# ---------- 分流规则 ----------
+# 主代理组名：PROXY（请确认订阅里确实是这个名字）
 +rules:
-  # 1. 优先走代理：fut.gg 相关（屏蔽中国大陆 IP）
+  # 1. fut.gg 全家走代理（屏蔽中国大陆 IP）
   - DOMAIN-SUFFIX,fut.gg,PROXY
   - DOMAIN-SUFFIX,stormstrike.gg,PROXY
   - DOMAIN-SUFFIX,easports.com,PROXY
@@ -20,43 +20,5 @@
   - DOMAIN-SUFFIX,origin.com,PROXY
   - DOMAIN-SUFFIX,eaapp.com,PROXY
 
-  # 2. 广告 / 恶意 / 追踪 域名拦截
-  - GEOSITE,category-ads-all,REJECT
-  - GEOSITE,private,REJECT
-
-  # 3. 国内域名/IP 直连（不绕路，速度快）
-  - GEOSITE,cn,DIRECT
-  - GEOIP,CN,DIRECT
-
-  # 4. 其余海外域名默认走代理（整体分流核心）
-  - GEOSITE,geolocation-!cn,PROXY
-
-  # 5. 局域网直连
-  - GEOIP,LAN,DIRECT
-  - GEOIP,private,DIRECT
-
-# ============================================================
-#  如需 DNS 净化，再手动添加下面这段（默认不带，避免打不开）：
-# ============================================================
-# dns:
-#   enable: true
-#   nameserver:
-#     - https://doh.pub/dns-query
-#     - https://dns.alidns.com/dns-query
-#   fallback:
-#     - https://dns.google/dns-query
-#     - https://cloudflare-dns.com/dns-query
-#   nameserver-policy:
-#     "geosite:cn":
-#       - https://doh.pub/dns-query
-#       - https://dns.alidns.com/dns-query
-#     "geosite:geolocation-!cn":
-#       - https://dns.google/dns-query
-#       - https://cloudflare-dns.com/dns-query
-#   proxy-server-nameserver:
-#     - https://dns.google/dns-query
-#   respect-rules: true
-#
-# 注意：自建 DoH（ccjccj.online）暂未加入，因为它可能导致
-# 客户端本地解析失败。若你的网络能直连它，可自行加入替换上面的
-# 任意国外 DoH 地址来测试。
+  # 2. 兜底：其余所有域名走代理
+  - MATCH,PROXY
