@@ -579,7 +579,7 @@ describe("ad blocking", () => {
       }),
       env
     );
-    expect(response.headers.get("cache-control")).toBe("public, max-age=300");
+    expect(response.headers.get("cache-control")).toBe("public, max-age=1800");
   });
 
   it("exposes aggregated stats behind the token gate", async () => {
@@ -609,5 +609,183 @@ describe("ad blocking", () => {
     const body = (await stats.json()) as { total: number; blocked: number };
     expect(body.total).toBeGreaterThanOrEqual(1);
     expect(body.blocked).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("performance: SWR cache and hedged upstreams", () => {
+  beforeEach(() => {
+    resetRuleCacheForTest();
+    resetAdListCacheForTest();
+    resetDnsCacheForTest();
+    resetStatsForTest();
+    vi.restoreAllMocks();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function postQuery(env: Parameters<typeof handleRequest>[1], ctx?: unknown): Promise<Response> {
+    return handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("swr.example.net", 1))
+      }),
+      env,
+      ctx as never
+    );
+  }
+
+  it("serves stale answers immediately and refreshes in the background", async () => {
+    vi.useFakeTimers();
+    try {
+      const { env } = await envWithRules();
+      let call = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          call += 1;
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          const response = craftUpstreamResponse(query, [
+            { type: 1, ttl: 60, rdata: Uint8Array.of(call, 0, 0, call) }
+          ]);
+          return new Response(toArrayBuffer(response), {
+            headers: { "content-type": "application/dns-message" }
+          });
+        })
+      );
+      const ctxPromises: Promise<unknown>[] = [];
+      const ctx = { waitUntil: (p: Promise<unknown>) => ctxPromises.push(p) };
+
+      const first = await postQuery(env, ctx);
+      expect(call).toBe(1);
+      expect(new Uint8Array(await first.arrayBuffer()).slice(-4)).toEqual(
+        Uint8Array.of(1, 0, 0, 1)
+      );
+
+      // 61 秒后条目过期，但仍在 30 分钟 stale 窗口内：立即返回旧值
+      vi.setSystemTime(Date.now() + 61_000);
+      const second = await postQuery(env, ctx);
+      expect(call).toBe(1); // 未打上游
+      expect(second.headers.get("cache-control")).toBe("no-store");
+      expect(new Uint8Array(await second.arrayBuffer()).slice(-4)).toEqual(
+        Uint8Array.of(1, 0, 0, 1)
+      );
+
+      // 后台刷新完成后，缓存里是新值
+      await Promise.all(ctxPromises);
+      expect(call).toBe(2);
+      const third = await postQuery(env, ctx);
+      expect(call).toBe(2);
+      expect(new Uint8Array(await third.arrayBuffer()).slice(-4)).toEqual(
+        Uint8Array.of(2, 0, 0, 2)
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hedges to the fallback when the primary is slow", async () => {
+    const { env } = await envWithRules();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const query = new Uint8Array(init?.body as ArrayBuffer);
+        if (String(input).includes("dns.google")) {
+          await sleep(600); // 超过 250ms 对冲窗口
+          return new Response(
+            toArrayBuffer(craftUpstreamResponse(query, [
+              { type: 1, ttl: 60, rdata: Uint8Array.of(1, 1, 1, 1) }
+            ])),
+            { headers: { "content-type": "application/dns-message" } }
+          );
+        }
+        return new Response(
+          toArrayBuffer(craftUpstreamResponse(query, [
+            { type: 1, ttl: 60, rdata: Uint8Array.of(2, 2, 2, 2) }
+          ])),
+          { headers: { "content-type": "application/dns-message" } }
+        );
+      })
+    );
+    const startedAt = Date.now();
+    const response = await postQuery(env);
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeLessThan(500);
+    expect(new Uint8Array(await response.arrayBuffer()).slice(-4)).toEqual(
+      Uint8Array.of(2, 2, 2, 2)
+    );
+  });
+
+  it("keeps the primary answer when it arrives within the hedge window", async () => {
+    const { env } = await envWithRules();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const query = new Uint8Array(init?.body as ArrayBuffer);
+        if (String(input).includes("dns.google")) {
+          return new Response(
+            toArrayBuffer(craftUpstreamResponse(query, [
+              { type: 1, ttl: 60, rdata: Uint8Array.of(1, 1, 1, 1) }
+            ])),
+            { headers: { "content-type": "application/dns-message" } }
+          );
+        }
+        await sleep(600);
+        return new Response(
+          toArrayBuffer(craftUpstreamResponse(query, [
+            { type: 1, ttl: 60, rdata: Uint8Array.of(2, 2, 2, 2) }
+          ])),
+          { headers: { "content-type": "application/dns-message" } }
+        );
+      })
+    );
+    const startedAt = Date.now();
+    const response = await postQuery(env);
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeLessThan(500);
+    expect(new Uint8Array(await response.arrayBuffer()).slice(-4)).toEqual(
+      Uint8Array.of(1, 1, 1, 1)
+    );
+  });
+
+  it("tracks upstream latency and cache hit rate in stats", async () => {
+    const { env } = await envWithRules(undefined, {
+      overrides: { STATS_TOKEN: "secret" }
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const query = new Uint8Array(init?.body as ArrayBuffer);
+        return new Response(
+          toArrayBuffer(craftUpstreamResponse(query, [
+            { type: 1, ttl: 120, rdata: Uint8Array.of(9, 9, 9, 9) }
+          ])),
+          { headers: { "content-type": "application/dns-message" } }
+        );
+      })
+    );
+    await postQuery(env);
+    await postQuery(env); // 命中缓存
+    await flushStats(env);
+
+    const stats = await handleRequest(
+      new Request("https://worker.example/stats?token=secret"),
+      env
+    );
+    const body = (await stats.json()) as {
+      total: number;
+      cacheHits: number;
+      cacheHitRate: number;
+      upstreamCount: number;
+      upstreamAvgMs: number;
+    };
+    expect(body.total).toBe(2);
+    expect(body.cacheHits).toBe(1);
+    expect(body.cacheHitRate).toBe(50);
+    expect(body.upstreamCount).toBe(1);
+    expect(body.upstreamAvgMs).toBeGreaterThanOrEqual(0);
   });
 });

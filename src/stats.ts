@@ -13,6 +13,10 @@ interface StatsState {
   total: number;
   blocked: number;
   top: Map<string, number>;
+  cacheHits: number;
+  staleServed: number;
+  upstreamMs: number;
+  upstreamCount: number;
   lastFlushAt: number;
   dirty: boolean;
 }
@@ -22,6 +26,10 @@ const state: StatsState = {
   total: 0,
   blocked: 0,
   top: new Map<string, number>(),
+  cacheHits: 0,
+  staleServed: 0,
+  upstreamMs: 0,
+  upstreamCount: 0,
   lastFlushAt: 0,
   dirty: false
 };
@@ -44,6 +52,18 @@ export function recordBlocked(domain: string): void {
   state.dirty = true;
 }
 
+export function recordCacheHit(stale = false): void {
+  state.cacheHits += 1;
+  if (stale) state.staleServed += 1;
+  state.dirty = true;
+}
+
+export function recordUpstreamLatency(ms: number): void {
+  state.upstreamMs += ms;
+  state.upstreamCount += 1;
+  state.dirty = true;
+}
+
 function dateKey(now = Date.now()): string {
   return new Date(now).toISOString().slice(0, 10);
 }
@@ -59,6 +79,10 @@ export async function flushStats(env: Env): Promise<void> {
   const payload = {
     total: state.total,
     blocked: state.blocked,
+    cacheHits: state.cacheHits,
+    staleServed: state.staleServed,
+    upstreamMs: Math.round(state.upstreamMs),
+    upstreamCount: state.upstreamCount,
     top: topEntries(state.top),
     updatedAt: new Date().toISOString()
   };
@@ -105,7 +129,7 @@ export async function handleStatsRequest(request: Request, env: Env): Promise<Re
     return new Response(null, { status: 404, headers: noStoreHeaders });
   }
 
-  const totals = { total: 0, blocked: 0, isolates: 0 };
+  const totals = { total: 0, blocked: 0, cacheHits: 0, staleServed: 0, upstreamMs: 0, upstreamCount: 0, isolates: 0 };
   const top = new Map<string, number>();
   for (const name of await listStatsKeys(env)) {
     let raw: unknown = null;
@@ -115,9 +139,16 @@ export async function handleStatsRequest(request: Request, env: Env): Promise<Re
       continue; // 单条快照损坏不影响整体聚合。
     }
     if (raw === null || typeof raw !== "object") continue;
-    const entry = raw as { total?: unknown; blocked?: unknown; top?: unknown };
+    const entry = raw as {
+      total?: unknown; blocked?: unknown; cacheHits?: unknown; staleServed?: unknown;
+      upstreamMs?: unknown; upstreamCount?: unknown; top?: unknown;
+    };
     if (typeof entry.total === "number") totals.total += entry.total;
     if (typeof entry.blocked === "number") totals.blocked += entry.blocked;
+    if (typeof entry.cacheHits === "number") totals.cacheHits += entry.cacheHits;
+    if (typeof entry.staleServed === "number") totals.staleServed += entry.staleServed;
+    if (typeof entry.upstreamMs === "number") totals.upstreamMs += entry.upstreamMs;
+    if (typeof entry.upstreamCount === "number") totals.upstreamCount += entry.upstreamCount;
     if (Array.isArray(entry.top)) {
       for (const item of entry.top) {
         if (Array.isArray(item) && typeof item[0] === "string" && typeof item[1] === "number") {
@@ -127,7 +158,17 @@ export async function handleStatsRequest(request: Request, env: Env): Promise<Re
     }
     totals.isolates += 1;
   }
-  const body = JSON.stringify({ ...totals, top: topEntries(top) }, null, 2);
+  const body = JSON.stringify(
+    {
+      ...totals,
+      upstreamAvgMs:
+        totals.upstreamCount > 0 ? Math.round(totals.upstreamMs / totals.upstreamCount) : 0,
+      cacheHitRate: totals.total > 0 ? Math.round((totals.cacheHits / totals.total) * 100) : 0,
+      top: topEntries(top)
+    },
+    null,
+    2
+  );
   return new Response(body, {
     status: 200,
     headers: { ...noStoreHeaders, "Content-Type": "application/json" }
@@ -158,6 +199,10 @@ export function resetStatsForTest(): void {
   state.total = 0;
   state.blocked = 0;
   state.top = new Map<string, number>();
+  state.cacheHits = 0;
+  state.staleServed = 0;
+  state.upstreamMs = 0;
+  state.upstreamCount = 0;
   state.lastFlushAt = 0;
   state.dirty = false;
 }
