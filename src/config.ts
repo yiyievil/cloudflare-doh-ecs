@@ -1,4 +1,5 @@
 import { isGlobalUnicast, parseIp } from "./ip";
+import { DEFAULT_ADBLOCK_LIST_URL } from "./adlist";
 import type { Env } from "./types";
 
 const DEFAULT_DOMESTIC = "https://dns.alidns.com/dns-query";
@@ -7,10 +8,15 @@ const DEFAULT_GLOBAL = "https://dns.google/dns-query";
 const DEFAULT_GLOBAL_FALLBACK = "https://cloudflare-dns.com/dns-query";
 const DEFAULT_PATH = "/doh";
 
+export type AdblockResponseMode = "nxdomain" | "zeroip" | "empty";
+
 export interface WorkerConfig {
   path: string;
   domesticUrls: readonly [string, string];
   globalUrls: readonly [string, string];
+  adblockEnabled: boolean;
+  adblockListUrl: string;
+  adblockResponse: AdblockResponseMode;
 }
 
 
@@ -57,6 +63,26 @@ function validateUpstream(value: string | undefined, fallback: string): string {
   return url.toString();
 }
 
+function validateAdblockEnabled(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "" || normalized === "true" || normalized === "1" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "false" || normalized === "0" || normalized === "off") {
+    return false;
+  }
+  throw new Error("invalid_adblock_enabled");
+}
+
+function validateAdblockResponse(value: string | undefined): AdblockResponseMode {
+  const normalized = (value ?? "nxdomain").trim().toLowerCase();
+  if (normalized === "nxdomain" || normalized === "zeroip" || normalized === "empty") {
+    return normalized;
+  }
+  throw new Error("invalid_adblock_response");
+}
+
 export function readConfig(env: Env): WorkerConfig {
   return {
     path: validatePath(env.DOH_PATH),
@@ -67,6 +93,9 @@ export function readConfig(env: Env): WorkerConfig {
     globalUrls: [
       validateUpstream(env.GLOBAL_DOH_URL, DEFAULT_GLOBAL),
       validateUpstream(env.GLOBAL_FALLBACK_DOH_URL, DEFAULT_GLOBAL_FALLBACK)
-    ]
+    ],
+    adblockEnabled: validateAdblockEnabled(env.ADBLOCK_ENABLED),
+    adblockListUrl: validateUpstream(env.ADBLOCK_LIST_URL, DEFAULT_ADBLOCK_LIST_URL),
+    adblockResponse: validateAdblockResponse(env.ADBLOCK_RESPONSE)
   };
 }

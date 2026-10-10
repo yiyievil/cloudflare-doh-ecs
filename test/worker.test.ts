@@ -1,8 +1,9 @@
-import { readU16, toArrayBuffer } from "../src/binary";
+import { concatBytes, readU16, toArrayBuffer, writeU16, writeU32 } from "../src/binary";
 import { parseDnsMessage } from "../src/dns";
-import { handleRequest } from "../src/index";
+import { handleRequest, resetAdListCacheForTest, resetDnsCacheForTest, resetStatsForTest } from "../src/index";
+import { flushStats } from "../src/stats";
 import { resetRuleCacheForTest } from "../src/rules";
-import { envWithRules, makeQuery, makeResponseFromQuery, MemoryKv } from "./helpers";
+import { encodeName, envWithRules, makeQuery, makeResponseFromQuery, MemoryKv } from "./helpers";
 
 function base64Url(data: Uint8Array): string {
   let binary = "";
@@ -10,9 +11,39 @@ function base64Url(data: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+interface CraftRecord {
+  type: number;
+  ttl?: number;
+  rdata: Uint8Array;
+}
+
+// 构造带 answer 区的上游应答（A/CNAME 等），用于 CNAME 链与 TTL 测试
+function craftUpstreamResponse(query: Uint8Array, records: CraftRecord[]): Uint8Array {
+  const parsed = parseDnsMessage(query);
+  const header = query.slice(0, 12);
+  header[2] = (header[2] ?? 0) | 0x80;
+  header[3] = (header[3] ?? 0) | 0x80;
+  writeU16(header, 6, records.length);
+  const parts: Uint8Array[] = [header, query.slice(12, parsed.question.endOffset)];
+  for (const record of records) {
+    const answer = new Uint8Array(12 + record.rdata.length);
+    writeU16(answer, 0, 0xc00c);
+    writeU16(answer, 2, record.type);
+    writeU16(answer, 4, 1);
+    writeU32(answer, 6, record.ttl ?? 60);
+    writeU16(answer, 10, record.rdata.length);
+    answer.set(record.rdata, 12);
+    parts.push(answer);
+  }
+  return concatBytes(parts);
+}
+
 describe("DoH worker", () => {
   beforeEach(() => {
     resetRuleCacheForTest();
+    resetAdListCacheForTest();
+    resetDnsCacheForTest();
+    resetStatsForTest();
     vi.restoreAllMocks();
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
   });
@@ -49,7 +80,8 @@ describe("DoH worker", () => {
     expect(destination).toBe("https://dns.alidns.com/dns-query");
     expect(redirect).toBe("manual");
     expect(parseDnsMessage(forwarded).opt).not.toBeNull();
-    expect(response.headers.get("cache-control")).toBe("no-store");
+    // 无 answer 记录时按默认 TTL 缓存
+    expect(response.headers.get("cache-control")).toBe("public, max-age=60");
   });
 
   it("routes foreign GET to Google and supports base64url", async () => {
@@ -228,8 +260,9 @@ describe("DoH worker", () => {
     expect(await badGet.text()).toBe("");
 
     const wrongPath = await handleRequest(new Request("https://worker.example/"), env);
-    expect(wrongPath.status).toBe(404);
-    expect(await wrongPath.text()).toBe("");
+    // 纯 DoH 域名的非 DoH 路径返回提示文案
+    expect(wrongPath.status).toBe(200);
+    expect(await wrongPath.text()).toContain("DNS-over-HTTPS endpoint");
 
     const wrongType = await handleRequest(
       new Request("https://worker.example/doh", {
@@ -282,5 +315,299 @@ describe("DoH worker", () => {
     );
     expect(response.status).toBe(200);
     expect(readU16(new Uint8Array(await response.arrayBuffer()), 2) & 0xf).toBe(2);
+  });
+});
+
+describe("ad blocking", () => {
+  beforeEach(() => {
+    resetRuleCacheForTest();
+    resetAdListCacheForTest();
+    resetDnsCacheForTest();
+    resetStatsForTest();
+    vi.restoreAllMocks();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  function stubUpstream() {
+    return vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = new Uint8Array(init?.body as ArrayBuffer);
+      return new Response(toArrayBuffer(makeResponseFromQuery(body)), {
+        headers: { "content-type": "application/dns-message" }
+      });
+    });
+  }
+
+  it("answers NXDOMAIN for blocklisted domains without contacting upstreams", async () => {
+    const { env } = await envWithRules();
+    const fetchMock = stubUpstream();
+    vi.stubGlobal("fetch", fetchMock);
+    const response = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("ads.g.doubleclick.net", 1))
+      }),
+      env
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+    const body = new Uint8Array(await response.arrayBuffer());
+    expect(readU16(body, 2) & 0xf).toBe(3); // NXDOMAIN
+    expect(parseDnsMessage(body).question.name.ruleName).toBe("ads.g.doubleclick.net");
+    expect(response.headers.get("cache-control")).toBe("public, max-age=30");
+  });
+
+  it("forwards queries for allowlisted domains even when blacklisted", async () => {
+    const { env } = await envWithRules(undefined, {
+      overrides: { ADBLOCK_ALLOWLIST: "doubleclick.net" }
+    });
+    const fetchMock = stubUpstream();
+    vi.stubGlobal("fetch", fetchMock);
+    const response = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 1))
+      }),
+      env
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readU16(new Uint8Array(await response.arrayBuffer()), 2) & 0xf).toBe(0);
+  });
+
+  it("stops blocking entirely when ADBLOCK_ENABLED=false", async () => {
+    const { env } = await envWithRules(undefined, {
+      overrides: { ADBLOCK_ENABLED: "false" }
+    });
+    const fetchMock = stubUpstream();
+    vi.stubGlobal("fetch", fetchMock);
+    const response = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 1))
+      }),
+      env
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readU16(new Uint8Array(await response.arrayBuffer()), 2) & 0xf).toBe(0);
+  });
+
+  it("answers 0.0.0.0/:: in zeroip mode and NOERROR-empty for other types", async () => {
+    const { env } = await envWithRules(undefined, {
+      overrides: { ADBLOCK_RESPONSE: "zeroip" }
+    });
+    const aResponse = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 1))
+      }),
+      env
+    );
+    const aBody = new Uint8Array(await aResponse.arrayBuffer());
+    expect(readU16(aBody, 2) & 0x0400).toBe(0x0400); // AA
+    expect(readU16(aBody, 6)).toBe(1);
+    expect(Array.from(aBody.slice(aBody.length - 4))).toEqual([0, 0, 0, 0]);
+
+    const aaaaResponse = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 28))
+      }),
+      env
+    );
+    const aaaaBody = new Uint8Array(await aaaaResponse.arrayBuffer());
+    expect(readU16(aaaaBody, 6)).toBe(1);
+    expect(Array.from(aaaaBody.slice(aaaaBody.length - 16))).toEqual(new Array<number>(16).fill(0));
+
+    const txtResponse = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 16))
+      }),
+      env
+    );
+    const txtBody = new Uint8Array(await txtResponse.arrayBuffer());
+    expect(readU16(txtBody, 2) & 0xf).toBe(0);
+    expect(readU16(txtBody, 6)).toBe(0);
+  });
+
+  it("answers NOERROR-empty in empty mode", async () => {
+    const { env } = await envWithRules(undefined, {
+      overrides: { ADBLOCK_RESPONSE: "empty" }
+    });
+    const response = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 1))
+      }),
+      env
+    );
+    const body = new Uint8Array(await response.arrayBuffer());
+    expect(readU16(body, 2) & 0xf).toBe(0);
+    expect(readU16(body, 6)).toBe(0);
+  });
+
+  it("blocks CNAME-cloaked targets", async () => {
+    const { env } = await envWithRules();
+    // answer: CNAME → doubleclick.net（黑名单命中）
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        const query = makeQuery("media.brand.example", 1);
+        const response = craftUpstreamResponse(query, [
+          { type: 5, rdata: encodeName("doubleclick.net") }
+        ]);
+        return new Response(toArrayBuffer(response), {
+          headers: { "content-type": "application/dns-message" }
+        });
+      })
+    );
+    const blocked = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("media.brand.example", 1))
+      }),
+      env
+    );
+    expect(readU16(new Uint8Array(await blocked.arrayBuffer()), 2) & 0xf).toBe(3);
+  });
+
+  it("honors allowlisted CNAME chains", async () => {
+    // answer: CNAME → hm.baidu.com（白名单豁免）
+    const { env } = await envWithRules(undefined, {
+      overrides: { ADBLOCK_ALLOWLIST: "hm.baidu.com" }
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        const query = makeQuery("media.brand.example", 1);
+        const response = craftUpstreamResponse(query, [
+          { type: 5, rdata: encodeName("hm.baidu.com") }
+        ]);
+        return new Response(toArrayBuffer(response), {
+          headers: { "content-type": "application/dns-message" }
+        });
+      })
+    );
+    const allowed = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("media.brand.example", 1))
+      }),
+      env
+    );
+    expect(readU16(new Uint8Array(await allowed.arrayBuffer()), 2) & 0xf).toBe(0);
+  });
+
+  it("does not conflate long domains sharing a truncated prefix", async () => {
+    const { env } = await envWithRules();
+    // 两个域名前 20+ 字节完全一致（旧 30 字节截断键会碰撞）
+    const first = makeQuery("aaaaaaaaaaaaaaaaaaaaaa1.example.net", 1);
+    const second = makeQuery("aaaaaaaaaaaaaaaaaaaaaa2.example.net", 1);
+    const responses = new Map<string, Uint8Array>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const query = new Uint8Array(init?.body as ArrayBuffer);
+        const parsed = parseDnsMessage(query);
+        const name = parsed.question.name.ruleName ?? "";
+        const digit = Number(/a+(\d)\.example/.exec(name)?.[1] ?? 0);
+        const response = craftUpstreamResponse(query, [
+          { type: 1, rdata: Uint8Array.of(10, 0, 0, digit) }
+        ]);
+        responses.set(name, response);
+        return new Response(toArrayBuffer(response), {
+          headers: { "content-type": "application/dns-message" }
+        });
+      })
+    );
+    const firstResponse = new Uint8Array(
+      await (
+        await handleRequest(
+          new Request("https://worker.example/doh", {
+            method: "POST",
+            headers: { "content-type": "application/dns-message" },
+            body: toArrayBuffer(first)
+          }),
+          env
+        )
+      ).arrayBuffer()
+    );
+    const secondResponse = new Uint8Array(
+      await (
+        await handleRequest(
+          new Request("https://worker.example/doh", {
+            method: "POST",
+            headers: { "content-type": "application/dns-message" },
+            body: toArrayBuffer(second)
+          }),
+          env
+        )
+      ).arrayBuffer()
+    );
+    // 第二个查询不得命中第一个的缓存（旧实现会返回 10.0.0.1）
+    expect(secondResponse.slice(-4)).toEqual(Uint8Array.of(10, 0, 0, 2));
+    expect(firstResponse.slice(-4)).toEqual(Uint8Array.of(10, 0, 0, 1));
+    expect(responses.size).toBe(2);
+  });
+
+  it("clamps cache TTL to the upstream answer TTL", async () => {
+    const { env } = await envWithRules();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const query = new Uint8Array(init?.body as ArrayBuffer);
+        const response = craftUpstreamResponse(query, [
+          { type: 1, ttl: 100000, rdata: Uint8Array.of(1, 2, 3, 4) }
+        ]);
+        return new Response(toArrayBuffer(response), {
+          headers: { "content-type": "application/dns-message" }
+        });
+      })
+    );
+    const response = await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("cache-ttl-up.example.net", 1))
+      }),
+      env
+    );
+    expect(response.headers.get("cache-control")).toBe("public, max-age=300");
+  });
+
+  it("exposes aggregated stats behind the token gate", async () => {
+    const { env } = await envWithRules(undefined, {
+      overrides: { STATS_TOKEN: "secret" }
+    });
+    await handleRequest(
+      new Request("https://worker.example/doh", {
+        method: "POST",
+        headers: { "content-type": "application/dns-message" },
+        body: toArrayBuffer(makeQuery("doubleclick.net", 1))
+      }),
+      env
+    );
+    await flushStats(env); // 测试环境没有 ctx，显式落盘
+    const noToken = await handleRequest(
+      new Request("https://worker.example/stats"),
+      env
+    );
+    expect(noToken.status).toBe(404);
+
+    const stats = await handleRequest(
+      new Request("https://worker.example/stats?token=secret"),
+      env
+    );
+    expect(stats.status).toBe(200);
+    const body = (await stats.json()) as { total: number; blocked: number };
+    expect(body.total).toBeGreaterThanOrEqual(1);
+    expect(body.blocked).toBeGreaterThanOrEqual(1);
   });
 });

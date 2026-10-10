@@ -1,11 +1,31 @@
 import { toArrayBuffer } from "./binary";
-import { buildDnsError, DnsFormatError, parseDnsMessage, validateUpstreamResponse } from "./dns";
+import {
+  buildDnsError,
+  buildSinkholeResponse,
+  cnameChainTargets,
+  DnsFormatError,
+  dnssecDo,
+  minAnswerTtl,
+  parseDnsMessage,
+  validateUpstreamResponse,
+  type DnsQuestion
+} from "./dns";
 import { rewriteEcs } from "./ecs";
 import { clientIpFromSingleHeader, clientIpFromXff, subnetForEcs } from "./ip";
 import { ensureRules, isDomesticDomain, updateRules } from "./rules";
-import { isAdDomain } from "./adblock";
+import { classifyDomain, ensureAdLists, updateAdList, type AdBlockLists } from "./adlist";
+import {
+  cleanupStats,
+  flushStats,
+  handleStatsRequest,
+  maybeFlushStats,
+  recordBlocked,
+  recordQuery,
+  resetStatsForTest
+} from "./stats";
 import { readConfig, type WorkerConfig } from "./config";
-import type { Env } from "./types";
+import { resetAdListCacheForTest } from "./adlist";
+import type { Env, WaitUntil } from "./types";
 
 const MAX_REQUEST_BYTES = 4096;
 const MAX_RESPONSE_BYTES = 65535;
@@ -13,13 +33,16 @@ const UPSTREAM_TIMEOUT_MS = 2000;
 const ECS_IPV4_PREFIX = 24;
 const ECS_IPV6_PREFIX = 56;
 const DNS_CONTENT_TYPE = "application/dns-message";
+const CACHE_MIN_TTL = 30;
+const CACHE_MAX_TTL = 300;
+const CACHE_DEFAULT_TTL = 60;
 
 // 内存级 DNS 响应缓存，减少重复上游查询
 const DNS_CACHE_MAX_SIZE = 512;
-const DNS_CACHE_TTL_MS = 60_000;
 interface DnsCacheEntry {
   body: Uint8Array;
   expiresAt: number;
+  maxAge: number;
 }
 const dnsCache = new Map<string, DnsCacheEntry>();
 
@@ -47,41 +70,40 @@ function isForcedDomestic(ruleName: string): boolean {
   );
 }
 
-function dnsCacheKey(query: Uint8Array): string {
-  // 跳过前 2 字节事务 ID，用 flags + question 部分作为缓存键
-  const start = 2;
-  const len = Math.min(query.length - start, 30);
-  let key = "";
-  for (let i = 0; i < len; i += 1) key += (query[start + i] ?? 0).toString(16).padStart(2, "0");
-  return key;
+// 缓存键必须覆盖完整 question 与 ECS 子网：截断键会让长域名互相污染，
+// 且不同子网客户端会共享彼此的 CDN 解析结果。
+function dnsCacheKey(parsed: { question: { name: { ruleName: string | null }; type: number; class: number } }, doBit: boolean, subnetKey: string): string {
+  const ruleName = parsed.question.name.ruleName;
+  if (ruleName === null || ruleName.length === 0) return "";
+  return `${ruleName}|${parsed.question.type}|${parsed.question.class}|${doBit ? 1 : 0}|${subnetKey}`;
 }
 
-// 从缓存生成响应：必须把响应报文的 2 字节事务 ID 替换为当前请求的事务 ID，
-// 否则客户端会因 ID 不匹配而丢弃响应。
-function dnsCacheGet(query: Uint8Array): Uint8Array | null {
-  const key = dnsCacheKey(query);
-  const entry = dnsCache.get(key);
-  if (entry === undefined) return null;
-  if (Date.now() > entry.expiresAt) {
-    dnsCache.delete(key);
-    return null;
+function subnetKeyOf(subnet: { family: number; prefixLength: number; network: Uint8Array } | null): string {
+  if (subnet === null) return "-";
+  const usedBytes = Math.ceil(subnet.prefixLength / 8);
+  let hex = "";
+  for (let i = 0; i < usedBytes; i += 1) {
+    hex += (subnet.network[i] ?? 0).toString(16).padStart(2, "0");
   }
-  const body = entry.body.slice();
-  if (body.length >= 2 && query.length >= 2) {
-    body[0] = query[0] ?? 0;
-    body[1] = query[1] ?? 0;
-  }
-  return body;
+  return `${subnet.family}/${subnet.prefixLength}/${hex}`;
 }
 
-function dnsCacheSet(query: Uint8Array, body: Uint8Array): void {
-  const key = dnsCacheKey(query);
+function dnsCacheSet(key: string, body: Uint8Array, ttlSeconds: number): void {
+  if (key === "") return;
   if (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
     // 简单淘汰：删除最早插入的条目
     const firstKey = dnsCache.keys().next().value;
     if (firstKey !== undefined) dnsCache.delete(firstKey);
   }
-  dnsCache.set(key, { body: body.slice(), expiresAt: Date.now() + DNS_CACHE_TTL_MS });
+  dnsCache.set(key, {
+    body: body.slice(),
+    expiresAt: Date.now() + ttlSeconds * 1000,
+    maxAge: ttlSeconds
+  });
+}
+
+function resetDnsCacheForTest(): void {
+  dnsCache.clear();
 }
 
 class UpstreamFailure extends Error {
@@ -250,7 +272,29 @@ async function fetchUpstream(url: string, query: Uint8Array): Promise<Uint8Array
   }
 }
 
-async function handleDns(request: Request, env: Env, config: WorkerConfig): Promise<Response> {
+// 按配置生成拦截响应：nxdomain（默认）/ zeroip（A/AAAA 记 sinkhole，其余 NOERROR 空）/ empty
+function buildBlockedBody(
+  query: Uint8Array,
+  config: WorkerConfig,
+  question: DnsQuestion
+): Uint8Array {
+  if (config.adblockResponse === "zeroip") {
+    const sinkhole = buildSinkholeResponse(query, question);
+    if (sinkhole !== null) return sinkhole;
+    return buildDnsError(query, 0, question);
+  }
+  if (config.adblockResponse === "empty") {
+    return buildDnsError(query, 0, question);
+  }
+  return buildDnsError(query, 3, question);
+}
+
+async function handleDns(
+  request: Request,
+  env: Env,
+  config: WorkerConfig,
+  ctx?: WaitUntil
+): Promise<Response> {
   const readResult = await readDnsRequest(request, config);
   if (readResult instanceof Response) return readResult;
   const originalQuery = readResult;
@@ -261,31 +305,49 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
   } catch {
     return dnsResponse(buildDnsError(originalQuery, 1));
   }
+  recordQuery();
 
-  // 广告域名拦截：命中黑名单直接返回 NXDOMAIN，不向上游查询
   const qname = parsed.question.name.ruleName;
-  if (qname !== null && isAdDomain(qname)) {
-    return dnsResponse(buildDnsError(originalQuery, 3, parsed.question));
+  let adLists: AdBlockLists | null = null;
+  if (config.adblockEnabled && qname !== null) {
+    adLists = await ensureAdLists(env);
+    if (adLists !== null && classifyDomain(adLists, qname) === "block") {
+      recordBlocked(qname);
+      return dnsResponse(buildBlockedBody(originalQuery, config, parsed.question), 200, CACHE_MIN_TTL);
+    }
   }
 
-  // 先查内存缓存（会替换事务 ID 为当前请求的 ID）
-  const cached = dnsCacheGet(originalQuery);
-  if (cached !== null) {
-    return dnsResponse(cached, 200, 30);
-  }
-
+  let subnetKey = "-";
   let forwardedQuery: Uint8Array;
   try {
     const ip =
       clientIpFromXff(request.headers.get("x-forwarded-for")) ??
       clientIpFromSingleHeader(request.headers.get("cf-connecting-ip"));
     const subnet = subnetForEcs(ip, ECS_IPV4_PREFIX, ECS_IPV6_PREFIX);
+    subnetKey = subnetKeyOf(subnet);
     forwardedQuery = rewriteEcs(originalQuery, parsed, subnet);
   } catch (error) {
     if (error instanceof DnsFormatError) {
       return dnsResponse(buildDnsError(originalQuery, 1, parsed.question));
     }
     return dnsResponse(buildDnsError(originalQuery, 2, parsed.question));
+  }
+
+  const cacheKey = dnsCacheKey(parsed, dnssecDo(parsed), subnetKey);
+  const cachedEntry = cacheKey === "" ? undefined : dnsCache.get(cacheKey);
+  if (cachedEntry !== undefined) {
+    if (Date.now() > cachedEntry.expiresAt) {
+      dnsCache.delete(cacheKey);
+    } else {
+      // 从缓存生成响应：必须把响应报文的 2 字节事务 ID 替换为当前请求的事务 ID，
+      // 否则客户端会因 ID 不匹配而丢弃响应。
+      const body = cachedEntry.body.slice();
+      if (body.length >= 2 && originalQuery.length >= 2) {
+        body[0] = originalQuery[0] ?? 0;
+        body[1] = originalQuery[1] ?? 0;
+      }
+      return dnsResponse(body, 200, cachedEntry.maxAge);
+    }
   }
 
   let domestic = false;
@@ -312,9 +374,27 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
         logUpstreamFailure(group, role, { reason: "dns_servfail" });
         continue;
       }
-      // 缓存成功响应
-      dnsCacheSet(originalQuery, upstreamBody);
-      return dnsResponse(upstreamBody, 200, 30);
+      // CNAME 链检查：追踪域名常借品牌域名 CNAME 伪装，逐级核对黑/白名单
+      if (adLists !== null) {
+        const targets = cnameChainTargets(upstreamInfo, upstreamBody);
+        let chainAllowed = false;
+        let chainBlocked: string | null = null;
+        for (const target of targets) {
+          const verdict = classifyDomain(adLists, target);
+          if (verdict === "allow") {
+            chainAllowed = true;
+            break;
+          }
+          if (verdict === "block" && chainBlocked === null) chainBlocked = target;
+        }
+        if (!chainAllowed && chainBlocked !== null) {
+          recordBlocked(chainBlocked);
+          return dnsResponse(buildBlockedBody(originalQuery, config, parsed.question), 200, CACHE_MIN_TTL);
+        }
+      }
+      const ttl = clampTtl(minAnswerTtl(upstreamInfo) ?? CACHE_DEFAULT_TTL);
+      dnsCacheSet(cacheKey, upstreamBody, ttl);
+      return dnsResponse(upstreamBody, 200, ttl);
     } catch (error) {
       logUpstreamFailure(group, role, upstreamFailureDiagnostic(error));
       // 仅在当前国内或国外组内尝试下一上游，不进行跨组回退。
@@ -323,8 +403,17 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
   return dnsResponse(buildDnsError(originalQuery, 2, parsed.question));
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+function clampTtl(ttl: number): number {
+  if (ttl < CACHE_MIN_TTL) return CACHE_MIN_TTL;
+  if (ttl > CACHE_MAX_TTL) return CACHE_MAX_TTL;
+  return ttl;
+}
+
+export async function handleRequest(request: Request, env: Env, ctx?: WaitUntil): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname === "/stats") {
+    return handleStatsRequest(request, env);
+  }
   const expectedPath = env.DOH_PATH ?? "/doh";
 
   // 纯 DoH 域名，非 DoH 路径返回提示
@@ -350,12 +439,25 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     return dnsResponse(buildDnsError(query, 2));
   }
-  return handleDns(request, env, config);
+  const response = await handleDns(request, env, config, ctx);
+  maybeFlushStats(env, ctx);
+  return response;
 }
 
+export async function runScheduledTasks(env: Env): Promise<void> {
+  await Promise.allSettled([
+    updateRules(env),
+    updateAdList(env),
+    flushStats(env),
+    cleanupStats(env)
+  ]);
+}
+
+export { resetDnsCacheForTest, resetStatsForTest, resetAdListCacheForTest };
+
 export default {
-  fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env);
+  fetch(request: Request, env: Env, ctx?: WaitUntil): Promise<Response> {
+    return handleRequest(request, env, ctx);
   },
 
   scheduled(
@@ -364,10 +466,7 @@ export default {
     ctx: ExecutionContext
   ): void {
     ctx.waitUntil(
-      updateRules(env).then(
-        () => undefined,
-        () => undefined
-      )
+      runScheduledTasks(env)
     );
   }
 } satisfies ExportedHandler<Env>;

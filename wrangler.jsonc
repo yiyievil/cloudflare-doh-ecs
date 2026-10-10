@@ -14,7 +14,9 @@
     "DOMESTIC_DOH_URL": "https://dns.alidns.com/dns-query",
     "DOMESTIC_FALLBACK_DOH_URL": "https://doh.pub/dns-query",
     "GLOBAL_DOH_URL": "https://dns.google/dns-query",
-    "GLOBAL_FALLBACK_DOH_URL": "https://cloudflare-dns.com/dns-query"
+    "GLOBAL_FALLBACK_DOH_URL": "https://cloudflare-dns.com/dns-query",
+    "ADBLOCK_ENABLED": "true",
+    "ADBLOCK_RESPONSE": "nxdomain"
   },
   "triggers": {
     "crons": ["17 3 * * *"]

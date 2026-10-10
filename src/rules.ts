@@ -211,7 +211,7 @@ function compareLineWithTarget(
   return leftRemaining === rightRemaining ? 0 : leftRemaining < rightRemaining ? -1 : 1;
 }
 
-function binarySearchRegion(
+export function binarySearchRegion(
   data: Uint8Array,
   regionStart: number,
   regionEnd: number,
@@ -286,7 +286,7 @@ export function isDomesticDomain(
   return false;
 }
 
-async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+export async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", buffer));
   let hex = "";
   for (const byte of digest) hex += byte.toString(16).padStart(2, "0");

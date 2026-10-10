@@ -1,4 +1,4 @@
-import { concatBytes, readU16, readU32, writeU16 } from "./binary";
+import { concatBytes, readU16, readU32, writeU16, writeU32 } from "./binary";
 
 const DNS_HEADER_LENGTH = 12;
 const MAX_POINTER_JUMPS = 128;
@@ -41,6 +41,7 @@ export interface DnsMessageInfo {
   answerCount: number;
   authorityCount: number;
   additionalCount: number;
+  answers: ResourceRecord[];
   opt: ResourceRecord | null;
   optAdditionalIndex: number;
 }
@@ -190,8 +191,11 @@ export function parseDnsMessage(data: Uint8Array): DnsMessageInfo {
   const question = parseQuestion(data, DNS_HEADER_LENGTH);
   let offset = question.endOffset;
 
+  const answers: ResourceRecord[] = [];
   for (let i = 0; i < answerCount + authorityCount; i += 1) {
-    offset = parseRecord(data, offset).end;
+    const record = parseRecord(data, offset);
+    if (i < answerCount) answers.push(record);
+    offset = record.end;
   }
 
   let opt: ResourceRecord | null = null;
@@ -222,6 +226,7 @@ export function parseDnsMessage(data: Uint8Array): DnsMessageInfo {
     answerCount,
     authorityCount,
     additionalCount,
+    answers,
     opt,
     optAdditionalIndex
   };
@@ -289,7 +294,7 @@ function encodeQuestion(question: DnsQuestion): Uint8Array {
 
 export function buildDnsError(
   request: Uint8Array,
-  rcode: 1 | 2 | 3,
+  rcode: 0 | 1 | 2 | 3,
   question?: DnsQuestion
 ): Uint8Array {
   const header = new Uint8Array(DNS_HEADER_LENGTH);
@@ -306,4 +311,66 @@ export function buildDnsError(
   writeU16(header, 4, question === undefined ? 0 : 1);
   if (question === undefined) return header;
   return concatBytes([header, encodeQuestion(question)]);
+}
+
+const SINKHOLE_TTL = 60;
+
+// 广告域名 sinkhole 应答：A 查询返回 0.0.0.0，AAAA 返回 ::；
+// 其余类型无法伪造记录，返回 null 由调用方改用 NOERROR 空 answer。
+export function buildSinkholeResponse(
+  request: Uint8Array,
+  question: DnsQuestion
+): Uint8Array | null {
+  const rdataLength = question.type === 1 ? 4 : question.type === 28 ? 16 : 0;
+  if (rdataLength === 0) return null;
+  const header = new Uint8Array(DNS_HEADER_LENGTH);
+  const id = request.length >= 2 ? readU16(request, 0) : 0;
+  const requestFlags = request.length >= 4 ? readU16(request, 2) : 0;
+  writeU16(header, 0, id);
+  writeU16(
+    header,
+    2,
+    0x8000 | (requestFlags & 0x7800) | (requestFlags & 0x0110) | 0x0400 | 0x0080
+  );
+  writeU16(header, 4, 1);
+  writeU16(header, 6, 1);
+  const answer = new Uint8Array(12 + rdataLength);
+  writeU16(answer, 0, 0xc00c);
+  writeU16(answer, 2, question.type);
+  writeU16(answer, 4, 1);
+  writeU32(answer, 6, SINKHOLE_TTL);
+  writeU16(answer, 10, rdataLength);
+  return concatBytes([header, encodeQuestion(question), answer]);
+}
+
+// 提取 answer 区所有 CNAME 指向的域名，用于追踪链检查。
+export function cnameChainTargets(
+  info: DnsMessageInfo,
+  message: Uint8Array
+): string[] {
+  const targets: string[] = [];
+  for (const record of info.answers) {
+    if (record.type !== 5) continue;
+    try {
+      const target = parseName(message, record.rdataStart);
+      if (
+        target.ruleName !== null &&
+        target.ruleName.length > 0 &&
+        !targets.includes(target.ruleName)
+      ) {
+        targets.push(target.ruleName);
+      }
+    } catch {
+      // 单条 CNAME 解析失败不影响其余记录的检查。
+    }
+  }
+  return targets;
+}
+
+export function minAnswerTtl(info: DnsMessageInfo): number | null {
+  let min: number | null = null;
+  for (const record of info.answers) {
+    if (min === null || record.ttl < min) min = record.ttl;
+  }
+  return min;
 }

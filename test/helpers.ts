@@ -1,4 +1,5 @@
 import { toArrayBuffer, writeU16, writeU32 } from "../src/binary";
+import { ADLIST_MANIFEST_KEY } from "../src/adlist";
 import type { Env, RuleManifest } from "../src/types";
 
 export function encodeName(name: string): Uint8Array {
@@ -114,14 +115,43 @@ export class MemoryKv {
     this.values.delete(key);
   }
 
+  async list(options: { prefix?: string; cursor?: string }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+  }> {
+    const prefix = options.prefix ?? "";
+    const names = [...this.values.keys()]
+      .filter((name) => name.startsWith(prefix))
+      .sort();
+    return { keys: names.map((name) => ({ name })), list_complete: true };
+  }
+
   asBinding(): KVNamespace {
     return this as unknown as KVNamespace;
   }
 }
 
+// 测试用广告列表 fixture：不得包含 www.qq.com / qq.com / example.net 等既有测试域名，
+// 否则会影响 worker.test.ts 里对上游调用次数的断言。
+export function makeAdListBytes(): Uint8Array {
+  const lines = [
+    "ads.example.com",
+    "cnzz.com",
+    "doubleclick.net",
+    "hm.baidu.com"
+  ];
+  return new TextEncoder().encode(lines.join("\n"));
+}
+
+interface EnvWithRulesOptions {
+  adlist?: Uint8Array | null;
+  overrides?: Partial<Env>;
+}
+
 export async function envWithRules(
-  rules = makeRuleBytes()
-): Promise<{ env: Env; kv: MemoryKv; version: string }> {
+  rules = makeRuleBytes(),
+  options: EnvWithRulesOptions = {}
+): Promise<{ env: Env; kv: MemoryKv; version: string; adlistVersion: string | null }> {
   const kv = new MemoryKv();
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", toArrayBuffer(rules)));
   let hash = "";
@@ -140,11 +170,41 @@ export async function envWithRules(
     updatedAt: new Date(0).toISOString()
   };
   await kv.put("rules:active", JSON.stringify(manifest));
+
+  let adlistVersion: string | null = null;
+  if (options.adlist !== null) {
+    const adBytes = options.adlist ?? makeAdListBytes();
+    adlistVersion = await seedAdList(kv, adBytes);
+  }
+
   return {
     env: {
-      RULES_KV: kv.asBinding()
+      RULES_KV: kv.asBinding(),
+      ...options.overrides
     },
     kv,
-    version
+    version,
+    adlistVersion
   };
+}
+
+export async function seedAdList(kv: MemoryKv, adBytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", toArrayBuffer(adBytes)));
+  let hash = "";
+  for (const byte of digest) hash += byte.toString(16).padStart(2, "0");
+  const version = `adlist:data:${hash}`;
+  const stored = adBytes.buffer.slice(
+    adBytes.byteOffset,
+    adBytes.byteOffset + adBytes.byteLength
+  ) as ArrayBuffer;
+  await kv.put(version, stored);
+  const manifest: RuleManifest = {
+    active: version,
+    previous: null,
+    sha256: hash,
+    size: adBytes.byteLength,
+    updatedAt: new Date(0).toISOString()
+  };
+  await kv.put(ADLIST_MANIFEST_KEY, JSON.stringify(manifest));
+  return version;
 }
